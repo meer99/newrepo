@@ -1,0 +1,951 @@
+// ============================================================================
+// Module: Container Registry (ACR)
+// Creates an Azure Container Registry with private endpoint support.
+// Note: Private endpoints require Premium SKU.
+// ============================================================================
+
+@description('Specifies the environment name (e.g., dev, sit, uat, prod)')
+param env string
+
+@description('Specifies the location for resources')
+param location string
+
+@description('Specifies tags to apply to the container registry')
+param tags object = {}
+
+@description('Specifies the name for ACR')
+param acrName string
+
+@description('Specifies the SKU for ACR (Premium required for private endpoints)')
+param acrSku string
+
+@description('Managed identity resource ID')
+param managedIdentityId string
+
+@description('Enable admin user')
+param adminUserEnabled bool = false
+
+// Load environment-specific parameters from JSON config
+var params = loadJsonContent('../variables/parameters.json')[env]
+
+// --- Existing Network Resources (for Private Endpoint) ---
+
+resource vnet 'Microsoft.Network/virtualNetworks@2021-03-01' existing = {
+  name: params.vnetname
+  scope: resourceGroup(params.vnetResourceGroup)
+}
+
+resource subnet 'Microsoft.Network/virtualNetworks/subnets@2021-03-01' existing = {
+  parent: vnet
+  name: params.peSubnetName
+}
+
+resource privateDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+  name: 'privatelink.azurecr.io'
+  scope: resourceGroup(params.dnsZoneSubscription, params.dnsZoneResourceGroup)
+}
+
+// --- Container Registry ---
+
+resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
+  name: acrName
+  location: location
+  tags: tags
+  sku: {
+    name: acrSku
+  }
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${managedIdentityId}': {}
+    }
+  }
+  properties: {
+    adminUserEnabled: adminUserEnabled
+    publicNetworkAccess: 'Disabled'
+    networkRuleBypassOptions: 'AzureServices'
+    zoneRedundancy: 'Disabled'
+    dataEndpointEnabled: false
+    encryption: {
+      status: 'disabled'
+    }
+  }
+}
+
+// --- Private Endpoint for ACR ---
+
+resource privateEndPoint 'Microsoft.Network/privateEndpoints@2021-05-01' = {
+  name: params.acrPrivateEndpointName
+  location: location
+  properties: {
+    subnet: {
+      id: subnet.id
+    }
+    privateLinkServiceConnections: [
+      {
+        name: params.acrPrivateEndpointName
+        properties: {
+          privateLinkServiceId: containerRegistry.id
+          groupIds: [
+            'registry'
+          ]
+        }
+      }
+    ]
+  }
+
+  // Private DNS Zone Group
+  resource dns_group 'privateDnsZoneGroups@2020-11-01' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: acrName
+          properties: {
+            privateDnsZoneId: privateDnsZone.id
+          }
+        }
+      ]
+    }
+  }
+}
+
+// --- Outputs ---
+
+@description('The name of the container registry')
+output containerRegistryName string = containerRegistry.name
+
+@description('The resource ID of the container registry')
+output containerRegistryId string = containerRegistry.id
+
+@description('The login server of the container registry')
+output containerRegistryLoginServer string = containerRegistry.properties.loginServer
+
+=================================================================
+
+// Module: Container App Job 1 - Account Sync (caj-ae-bcrevdata-accsync-{env})
+
+@description('Specifies the tag values for Environment')
+param env string
+
+@description('Specifies the location for resource')
+param location string
+
+@description('Specifies tags to apply to the container registry')
+param tags object = {}
+
+@description('Specifies Container Apps Environment resource ID')
+param containerAppsEnvironmentId string
+
+@description('Managed identity resource ID')
+param managedIdentityId string
+
+//@description('Container image (e.g., mcr.microsoft.com/azuredocs/containerapps-helloworld:latest)')
+param containerImage string
+// = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+
+var jobName = 'caj-ae-bcrevdata-accsync-${env}'
+var containerName = 'caj-ae-bcrevdata-accsync-${env}'
+var cpu = '0.25'
+var memory = '0.5Gi'
+var triggerType = 'Manual'
+var replicaTimeout = 1800
+var replicaRetryLimit = 0
+var parallelism = 1
+var replicaCompletionCount = 1
+
+resource containerAppJob 'Microsoft.App/jobs@2023-05-01' = {
+  name: jobName
+  location: location
+  tags: tags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${managedIdentityId}': {}
+    }
+  }
+  properties: {
+    environmentId: containerAppsEnvironmentId
+    configuration: {
+      replicaTimeout: replicaTimeout
+      replicaRetryLimit: replicaRetryLimit
+      triggerType: triggerType
+      manualTriggerConfig: {
+        parallelism: parallelism
+        replicaCompletionCount: replicaCompletionCount
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: containerName
+          image: containerImage
+          resources: {
+            cpu: json(cpu)
+            memory: memory
+          }
+        }
+      ]
+    }
+  }
+}
+
+@description('The name of the container app job')
+output containerAppJobName string = containerAppJob.name
+
+@description('The resource ID of the container app job')
+output containerAppJobId string = containerAppJob.id
+
+=======================================================
+// Description: Dedicated module for caj-ae-bcrevproc-sah-cb-{env}
+
+@description('Specifies the tag values for Environment')
+param env string
+
+@description('Specifies the location for resource')
+param location string
+
+@description('Specifies tags to apply to the container registry')
+param tags object = {}
+
+@description('Specifies Container Apps Environment resource ID')
+param containerAppsEnvironmentId string
+
+@description('Managed identity resource ID')
+param managedIdentityId string
+
+//@description('Container image (e.g., mcr.microsoft.com/azuredocs/containerapps-helloworld:latest)')
+param containerImage string
+// = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+
+var jobName = 'caj-ae-bcrevproc-sah-cb-${env}'
+var containerName = 'caj-ae-bcrevproc-sah-cb-${env}'
+var cpu = '0.25'
+var memory = '0.5Gi'
+var triggerType = 'Manual'
+var replicaTimeout = 1800
+var replicaRetryLimit = 0
+var parallelism = 1
+var replicaCompletionCount = 1
+
+resource containerAppJob 'Microsoft.App/jobs@2023-05-01' = {
+  name: jobName
+  location: location
+  tags: tags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${managedIdentityId}': {}
+    }
+  }
+  properties: {
+    environmentId: containerAppsEnvironmentId
+    configuration: {
+      replicaTimeout: replicaTimeout
+      replicaRetryLimit: replicaRetryLimit
+      triggerType: triggerType
+      manualTriggerConfig: {
+        parallelism: parallelism
+        replicaCompletionCount: replicaCompletionCount
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: containerName
+          image: containerImage
+          resources: {
+            cpu: json(cpu)
+            memory: memory
+          }
+        }
+      ]
+    }
+  }
+}
+
+@description('The name of the container app job')
+output containerAppJobName string = containerAppJob.name
+
+@description('The resource ID of the container app job')
+output containerAppJobId string = containerAppJob.id
+
+======================================================
+
+
+// ============================================================================
+// Module: Container Apps Environment
+// Creates a Container Apps Environment with Log Analytics integration.
+// ============================================================================
+
+@description('Specifies the environment name (e.g., dev, sit, uat, prod)')
+#disable-next-line no-unused-params
+param env string
+
+@description('Specifies the location for resources')
+param location string
+
+@description('Specifies tags to apply to resources')
+param tags object = {}
+
+@description('Specifies Container Apps Environment name')
+param caeName string
+
+@description('Managed identity resource ID')
+param managedIdentityId string
+
+@description('Log Analytics workspace customer ID')
+param logAnalyticsCustomerId string
+
+@description('Log Analytics workspace shared key')
+@secure()
+param logAnalyticsSharedKey string
+
+// --- Container Apps Environment ---
+
+resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-10-02-preview' = {
+  name: caeName
+  location: location
+  tags: tags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${managedIdentityId}': {}
+    }
+  }
+  properties: {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logAnalyticsCustomerId
+        sharedKey: logAnalyticsSharedKey
+      }
+    }
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
+    zoneRedundant: false
+  }
+}
+
+// --- Outputs ---
+
+@description('The name of the container apps environment')
+output containerAppsEnvironmentName string = containerAppsEnvironment.name
+
+@description('The resource ID of the container apps environment')
+output containerAppsEnvironmentId string = containerAppsEnvironment.id
+
+@description('The default domain of the container apps environment')
+output containerAppsEnvironmentDefaultDomain string = containerAppsEnvironment.properties.defaultDomain
+
+@description('The static IP address of the container apps environment')
+output containerAppsEnvironmentStaticIp string = containerAppsEnvironment.properties.staticIp
+
+==========================================================
+
+/**
+    This Bicep file deploys a new Log Analytics WorkSpace.
+    - The script defines params:
+        - location
+        - logAnalyticsName
+    - LogAnalytics resource is of type 'Microsoft.OperationalInsights/workspaces@2022-10-01'.
+
+**/
+
+@description('Specifies the location for resource')
+param location string
+
+@description('Specifies the name of log analytics')
+param logAnalyticsName string
+
+@description('Specifies the tags for resources')
+param tagDetails object
+
+//Create log analytics
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
+  name: logAnalyticsName
+  location: location
+  tags: tagDetails
+}
+
+output logAnalyticsID string = logAnalytics.id
+output logAnalyticsCustomerId string = logAnalytics.properties.customerId
+
+// Suppressed: secret is only consumed by modules within the same deployment
+#disable-next-line outputs-should-not-contain-secrets
+output logAnalyticsSharedKey string = logAnalytics.listKeys().primarySharedKey
+
+==============================================================
+
+// Module: Managed Identity - Creates a user-assigned managed identity
+
+//@description('Environment name (dev1, sit, uat, prod)')
+//param environment string
+
+@description('Region for resources')
+param location string
+
+@description('Tags to apply to the managed identity')
+param tags object = {}
+
+//@description('Managed identity name pattern')
+//param namePattern string = 'mi-ae-bcrevdata'
+
+@description('Managed identity')
+param managedIdentityName string
+
+//var managedIdentityName = '${namePattern}-${environment}'
+
+resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: managedIdentityName
+  location: location
+  tags: tags
+}
+
+output managedIdentityName string = managedIdentity.name
+output managedIdentityId string = managedIdentity.id
+output managedIdentityPrincipalId string = managedIdentity.properties.principalId
+output managedIdentityClientId string = managedIdentity.properties.clientId
+
+
+==========================================================
+/**
+    This Bicep file deploys a new SQL DataBase.
+    - The script defines params:
+        - location
+        - sqlDataBaseName
+    - SQL Server resource is of type 'Microsoft.Sql/servers/databases@2022-08-01-preview'.
+**/
+
+@description('Specifies the location for resource')
+param location string
+
+@description('Specifies the name of SQL DataBase')
+param sqlDataBaseName string
+
+@description('Specifies the tags for resources')
+param tagDetails object
+
+@description('Specifies the  name of SQL Server')
+param sqlServerName string
+
+@description('Specifies the value of max size')
+param maxSizeBytes int
+
+@description('Specifies the  BackupStorageRedundancy ')
+param requestedBackupStorageRedundancy string
+
+@description('Specifies the value of min capacity')
+param minCapacity string
+
+@description('Specifies the  Availibilty Zone')
+param availabilityZone string
+
+@description('Specifies the sku for sql database')
+param sqlDbSKU object
+
+
+resource sqlDataBase 'Microsoft.Sql/servers/databases@2022-08-01-preview' = {
+  name: '${sqlServerName}/${sqlDataBaseName}'
+  location: location
+  tags: tagDetails
+  sku: sqlDbSKU
+  properties: {
+    maxSizeBytes: maxSizeBytes
+    zoneRedundant: false
+    readScale: 'Disabled'
+    requestedBackupStorageRedundancy: requestedBackupStorageRedundancy
+    minCapacity: json(minCapacity)
+    isLedgerOn: false
+    availabilityZone: availabilityZone
+  }
+}
+
+====================================================================
+
+/**
+    This Bicep file deploys a new SQL Server.
+    - The script defines params:
+        - location
+        - sqlServerName
+        - tagDetails
+    - SQL Server resource is of type 'Microsoft.Sql/servers@2022-08-01-preview'.
+    - Private End Point resource is of type 'Microsoft.Network/privateEndpoints@2021-05-01'
+**/
+
+@description('Specifies the location for resource')
+param location string
+
+@description('Specifies the tag values for Environment')
+param env string
+
+@description('Specifies the name of SQL Server')
+param sqlServerName string
+
+@description('Specifies the tags for resources')
+param tagDetails object
+
+@description('Specifies the admin username of sql server')
+@secure()
+param administratorLogin string
+
+@description('Specifies the admin passowrd of sql server')
+@secure()
+param administratorLoginPassword string
+
+@description('Specifies the name of virtual network name')
+param virtualNetworkName string
+
+@description('Specifies the name of vnet Resource Group.')
+param vnetResourceGroup string
+
+@description('Specifies the name of private endpoint subnet name')
+param subnetName string
+
+@description('Specifies the name of private end point for sql server')
+param sqlServerPrivateEndPoint string
+
+@description('Specifies the name of private end point nic name')
+param sqlServerPENicName string
+
+@description('Specifies the tags for resources')
+param commonParams object = loadJsonContent('../variables/parameters.json')[env]
+
+//Get vnet details and id
+resource vnet 'Microsoft.Network/virtualNetworks@2021-03-01' existing = {
+  name: virtualNetworkName
+  scope: resourceGroup(vnetResourceGroup)
+}
+
+//Get private end point details
+resource privateEndpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2021-03-01' existing = {
+  parent: vnet
+  name: subnetName
+}
+
+
+resource privateDnsZonesql 'Microsoft.Network/privateDnsZones@2020-06-01' existing = { 
+  #disable-next-line no-hardcoded-env-urls
+  name: 'privatelink.database.windows.net' 
+  scope: resourceGroup(commonParams.dnsZoneSubscription,commonParams.dnsZoneResourceGroup)
+}
+
+
+resource sqlServer 'Microsoft.Sql/servers@2022-08-01-preview' = {
+  name: sqlServerName
+  location: location
+  tags: tagDetails
+  properties: {
+    administratorLogin: administratorLogin
+    administratorLoginPassword: administratorLoginPassword
+    version: '12.0'
+    minimalTlsVersion: '1.2'
+    publicNetworkAccess: 'Enabled'
+    restrictOutboundNetworkAccess: 'Disabled'
+  }
+}
+
+//Create private end point and associate with sql server
+resource privateEndPoint 'Microsoft.Network/privateEndpoints@2022-09-01' = {
+  name: sqlServerPrivateEndPoint
+  location: location
+  properties: {
+    subnet: {
+      id: privateEndpointSubnet.id
+    }
+    customNetworkInterfaceName: sqlServerPENicName
+    privateLinkServiceConnections: [
+      {
+        name: sqlServerPrivateEndPoint
+        properties: {
+          privateLinkServiceId: sqlServer.id
+          groupIds: [
+            'sqlServer'
+          ]
+          privateLinkServiceConnectionState: {
+            status: 'Approved'
+            description: 'Auto-approved'
+          }
+        }
+      }
+    ]
+  }
+  
+  // Create Private DNS Zone Group 
+  resource dns_group 'privateDnsZoneGroups@2020-11-01' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: sqlServerName
+          properties: {
+            privateDnsZoneId: privateDnsZonesql.id
+          }
+        }
+      ]
+    }
+  }
+}
+===================================
+{
+  "dev": {
+    "location": "australiaeast",
+    "resourceGroup": "rg-ae-bcrev-dev",
+    "vnetname": "vnet-ae-internal-test",
+    "subnetName": "snet-ae-bcrev-dev",
+    "peSubnetName": "snet-ae-bcrev-pe-dev",
+    "vnetResourceGroup": "rg-ae-net-test",
+    "dnsZoneResourceGroup": "rg-ae-dnszones-mgmt",
+    "dnsZoneSubscription": "ff34e9ad-36c8-46fa-b663-22eeca336377",
+    "acrName": "acraebcrev",
+    "acrSku": "Premium",
+    "acrPrivateEndpointName": "pe-acraebcrev-dev",
+    "managedIdentity": "mi-ae-bcrevdata",
+    "caeName": "cae-ae-bcrev",
+    "containerAppJobaccsync": "caj-ae-bcrevdata-accsync",
+    "containerAppJobsah": "caj-ae-bcrevproc-sah-cb",
+    "sqlServerName": "sql-ae-bcrevdata",
+    "sqlDataBaseName": "bc_cc_revenue_data",
+    "logAnalyticsName": "log-ae-bcrevdata",
+    "sqlServerPrivateEndPoint": "pe-sql-ae-bcrevdata-dev",
+    "sqlServerPENicName": "nic-pe-sql-ae-bcrevdata-dev"
+  }
+}
+===================================================
+
+
+{
+  "ApplicationName": "StrategicBilling",
+  "Approver": "Andrew.Harvey1@ucareqld.com.au",
+  "BusinessOwner": "BlueCare",
+  "BusinessUnit": "Digital Platforms",
+  "CostCenter": "123024",
+  "Environment": "Dev1",
+  "ProjectCode": "PJ201372-0002",
+  "ProjectName": "bcrev",
+  "TechnicalOwner": ""
+}
+
+
+===============================
+
+# Azure Pipeline - Bicep Infrastructure Deployment
+# Prerequisites:
+#   - Service connection: 'azure-service-connection'
+#   - Pipeline variables: sqlAdminLogin, sqlAdminPassword (secret)
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: environment
+    displayName: 'Target Environment'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+
+variables:
+  azureServiceConnection: 'azure-service-connection'
+  resourceGroup: 'rg-ae-bcrev-${{ parameters.environment }}'
+  location: 'australiaeast'
+
+steps:
+  - checkout: self
+
+  # Step 1: Validate Bicep
+  - task: AzureCLI@2
+    displayName: 'Validate Bicep'
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az bicep build --file main.bicep
+        az deployment group validate \
+          --resource-group $(resourceGroup) \
+          --template-file main.bicep \
+          --parameters env=${{ parameters.environment }} \
+          --parameters sqlAdminLogin=$(sqlAdminLogin) \
+          --parameters sqlAdminPassword=$(sqlAdminPassword)
+
+  # Step 2: Preview changes
+  - task: AzureCLI@2
+    displayName: 'What-If Preview'
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az deployment group what-if \
+          --resource-group $(resourceGroup) \
+          --template-file main.bicep \
+          --parameters env=${{ parameters.environment }} \
+          --parameters sqlAdminLogin=$(sqlAdminLogin) \
+          --parameters sqlAdminPassword=$(sqlAdminPassword)
+
+  # Step 3: Deploy
+  - task: AzureCLI@2
+    displayName: 'Deploy Bicep'
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az deployment group create \
+          --name "deploy-ccss-$(Build.BuildNumber)" \
+          --resource-group $(resourceGroup) \
+          --template-file main.bicep \
+          --parameters env=${{ parameters.environment }} \
+          --parameters sqlAdminLogin=$(sqlAdminLogin) \
+          --parameters sqlAdminPassword=$(sqlAdminPassword)
+====================================================
+#!/bin/bash
+# Deploy Bicep Infrastructure via Azure CLI
+# Called from Azure DevOps release pipeline
+# Variables ENVIRONMENT, RESOURCE_GROUP, SQL_ADMIN_LOGIN, SQL_ADMIN_PASSWORD
+# are provided by the pipeline/release
+
+set -euo pipefail
+
+az deployment group create \
+  --name "deploy-ccss" \
+  --resource-group "$RESOURCE_GROUP" \
+  --template-file main.bicep \
+  --parameters env="$ENVIRONMENT" \
+  --parameters sqlAdminLogin="$SQL_ADMIN_LOGIN" \
+  --parameters sqlAdminPassword="$SQL_ADMIN_PASSWORD" \
+  --output table
+
+echo "Deployment completed!"
+===============================================
+// ============================================================================
+// Main Bicep Template - Infrastructure Orchestration
+// ============================================================================
+// Deploys the following resources in order:
+//   1. Managed Identity       (used by ACR, CAE, and Container App Jobs)
+//   2. Log Analytics Workspace (provides logging for CAE)
+//   3. Container Registry      (ACR with private endpoint)
+//   4. Container Apps Env      (hosts Container App Jobs)
+//   5. Container App Job 1     (Account Sync - accsync)
+//   6. Container App Job 2     (SAH CB processor)
+//   7. SQL Server              (with private endpoint)
+//   8. SQL Database            (hosted on the SQL Server)
+// ============================================================================
+
+// --- Parameters ---
+
+@description('Environment name (e.g., dev, sit, uat, prod)')
+param env string = 'dev'
+
+@description('SQL Server administrator login username')
+@secure()
+param sqlAdminLogin string
+
+@description('SQL Server administrator login password')
+@secure()
+param sqlAdminPassword string
+
+@description('Container image for the Account Sync job')
+param containerImageAccSync string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+
+@description('Container image for the SAH CB job')
+param containerImageSah string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+
+// --- Variables ---
+
+// Load environment-specific config and resource tags from JSON files
+var params = loadJsonContent('variables/parameters.json')[env]
+var tags = loadJsonContent('variables/tags.json')
+
+// ============================================================================
+// 1. Managed Identity
+//    Created first because ACR, CAE, and Container App Jobs depend on it.
+// ============================================================================
+
+module managedIdentity 'modules/managed_identity.bicep' = {
+  name: 'deploy-managed-identity'
+  params: {
+    location: params.location
+    managedIdentityName: params.managedIdentity
+    tags: tags
+  }
+}
+
+// ============================================================================
+// 2. Log Analytics Workspace
+//    Provides monitoring and logging for the Container Apps Environment.
+// ============================================================================
+
+module logAnalytics 'modules/log_analytics.bicep' = {
+  name: 'deploy-log-analytics'
+  params: {
+    location: params.location
+    logAnalyticsName: params.logAnalyticsName
+    tagDetails: tags
+  }
+}
+
+// ============================================================================
+// 3. Container Registry (ACR)
+//    Stores container images. Uses private endpoint for secure access.
+//    Depends on: Managed Identity
+// ============================================================================
+
+module containerRegistry 'modules/container_registry.bicep' = {
+  name: 'deploy-container-registry'
+  params: {
+    env: env
+    location: params.location
+    acrName: params.acrName
+    acrSku: params.acrSku
+    managedIdentityId: managedIdentity.outputs.managedIdentityId
+    tags: tags
+  }
+}
+
+// ============================================================================
+// 4. Container Apps Environment
+//    Hosts the Container App Jobs with consumption-based workload profiles.
+//    Depends on: Managed Identity, Log Analytics
+// ============================================================================
+
+module containerAppsEnvironment 'modules/containerapps_environment.bicep' = {
+  name: 'deploy-container-apps-environment'
+  params: {
+    env: env
+    location: params.location
+    caeName: params.caeName
+    managedIdentityId: managedIdentity.outputs.managedIdentityId
+    logAnalyticsCustomerId: logAnalytics.outputs.logAnalyticsCustomerId
+    logAnalyticsSharedKey: logAnalytics.outputs.logAnalyticsSharedKey
+    tags: tags
+  }
+}
+
+// ============================================================================
+// 5. Container App Job - Account Sync
+//    Manually-triggered job for account synchronization.
+//    Depends on: Managed Identity, Container Apps Environment
+// ============================================================================
+
+module containerAppJobAccSync 'modules/containerapp_job1.bicep' = {
+  name: 'deploy-containerapp-job-accsync'
+  params: {
+    env: env
+    location: params.location
+    containerAppsEnvironmentId: containerAppsEnvironment.outputs.containerAppsEnvironmentId
+    managedIdentityId: managedIdentity.outputs.managedIdentityId
+    containerImage: containerImageAccSync
+    tags: tags
+  }
+}
+
+// ============================================================================
+// 6. Container App Job - SAH CB
+//    Manually-triggered job for SAH CB processing.
+//    Depends on: Managed Identity, Container Apps Environment
+// ============================================================================
+
+module containerAppJobSah 'modules/containerapp_job2.bicep' = {
+  name: 'deploy-containerapp-job-sah'
+  params: {
+    env: env
+    location: params.location
+    containerAppsEnvironmentId: containerAppsEnvironment.outputs.containerAppsEnvironmentId
+    managedIdentityId: managedIdentity.outputs.managedIdentityId
+    containerImage: containerImageSah
+    tags: tags
+  }
+}
+
+// ============================================================================
+// 7. SQL Server
+//    Deploys SQL Server with private endpoint for secure connectivity.
+// ============================================================================
+
+module sqlServer 'modules/sql_server.bicep' = {
+  name: 'deploy-sql-server'
+  params: {
+    env: env
+    location: params.location
+    sqlServerName: params.sqlServerName
+    tagDetails: tags
+    administratorLogin: sqlAdminLogin
+    administratorLoginPassword: sqlAdminPassword
+    virtualNetworkName: params.vnetname
+    vnetResourceGroup: params.vnetResourceGroup
+    subnetName: params.subnetName
+    sqlServerPrivateEndPoint: params.sqlServerPrivateEndPoint
+    sqlServerPENicName: params.sqlServerPENicName
+  }
+}
+
+// ============================================================================
+// 8. SQL Database
+//    Creates the database on the SQL Server above.
+//    Depends on: SQL Server
+// ============================================================================
+
+module sqlDatabase 'modules/sql_database.bicep' = {
+  name: 'deploy-sql-database'
+  dependsOn: [ sqlServer ]
+  params: {
+    location: params.location
+    sqlServerName: params.sqlServerName
+    sqlDataBaseName: params.sqlDataBaseName
+    tagDetails: tags
+    maxSizeBytes: 5368709120              // 5 GB
+    requestedBackupStorageRedundancy: 'Local'
+    minCapacity: '0'
+    availabilityZone: 'NoPreference'
+    sqlDbSKU: {
+      name: 'S0'
+      tier: 'Standard'
+      capacity: 10
+    }
+  }
+}
+
+// ============================================================================
+// Outputs
+// ============================================================================
+
+@description('Managed Identity resource ID')
+output managedIdentityId string = managedIdentity.outputs.managedIdentityId
+
+@description('Managed Identity principal ID')
+output managedIdentityPrincipalId string = managedIdentity.outputs.managedIdentityPrincipalId
+
+@description('Container Registry login server')
+output acrLoginServer string = containerRegistry.outputs.containerRegistryLoginServer
+
+@description('Container Apps Environment ID')
+output containerAppsEnvironmentId string = containerAppsEnvironment.outputs.containerAppsEnvironmentId
+
+@description('Container App Job - Account Sync name')
+output containerAppJobAccSyncName string = containerAppJobAccSync.outputs.containerAppJobName
+
+@description('Container App Job - SAH CB name')
+output containerAppJobSahName string = containerAppJobSah.outputs.containerAppJobName
+=============================================================
+
+
+
+
+
+
+
+
+
+
+
